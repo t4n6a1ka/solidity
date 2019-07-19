@@ -126,10 +126,13 @@ void CHC::endVisit(ContractDefinition const& _contract)
 	if (!shouldVisit(_contract))
 		return;
 
-	auto errorAppl = (*m_errorPredicate)({});
-	for (auto const& target: m_verificationTargets)
+	for (unsigned i = 0; i < m_verificationTargets.size(); ++i)
+	{
+		auto const& target = m_verificationTargets.at(i);
+		auto errorAppl = error(i + 1);
 		if (query(errorAppl, target->location()))
 			m_safeAssertions.insert(target);
+	}
 
 	SMTEncoder::endVisit(_contract);
 
@@ -158,7 +161,10 @@ bool CHC::visit(FunctionDefinition const& _function)
 		m_interfacePredicate->currentName() + "_to_" + m_predicates.at(m_currentFunction)->currentName()
 	);
 
+	smt::Expression const& currentAssertions = m_context.assertions();
 	pushBlock(predicateCurrent(m_currentFunction));
+	// We need to re-add the constraints that were created for function initialization.
+	m_context.addAssertion(currentAssertions);
 	solAssert(m_functionBlocks == 0, "");
 	m_functionBlocks = 1;
 
@@ -212,15 +218,51 @@ bool CHC::visit(IfStatement const& _if)
 
 bool CHC::visit(WhileStatement const& _while)
 {
-	eraseKnowledge();
-	m_context.resetVariables(touchedVariables(_while));
+	bool unknownFunctionCallSeen = false;
+	swap(m_unknownFunctionCallSeen, unknownFunctionCallSeen);
+
+	solAssert(m_currentFunction, "");
+
+	if (_while.isDoWhile())
+		_while.body().accept(*this);
+
+	visitLoop(
+		_while,
+		&_while.condition(),
+		_while.body(),
+		nullptr
+	);
+
+	if (m_unknownFunctionCallSeen)
+		eraseKnowledge();
+
+	m_unknownFunctionCallSeen = unknownFunctionCallSeen;
+
 	return false;
 }
 
 bool CHC::visit(ForStatement const& _for)
 {
-	eraseKnowledge();
-	m_context.resetVariables(touchedVariables(_for));
+	bool unknownFunctionCallSeen = false;
+	swap(m_unknownFunctionCallSeen, unknownFunctionCallSeen);
+
+	solAssert(m_currentFunction, "");
+
+	if (auto init = _for.initializationExpression())
+		init->accept(*this);
+
+	visitLoop(
+		_for,
+		_for.condition(),
+		_for.body(),
+		_for.loopExpression()
+	);
+
+	if (m_unknownFunctionCallSeen)
+		eraseKnowledge();
+
+	m_unknownFunctionCallSeen = unknownFunctionCallSeen;
+
 	return false;
 }
 
@@ -265,6 +307,18 @@ void CHC::endVisit(FunctionCall const& _funCall)
 	}
 }
 
+void CHC::endVisit(Break const&)
+{
+	eraseKnowledge();
+	m_context.resetVariables([](VariableDeclaration const&) { return true; });
+}
+
+void CHC::endVisit(Continue const&)
+{
+	eraseKnowledge();
+	m_context.resetVariables([](VariableDeclaration const&) { return true; });
+}
+
 void CHC::visitAssert(FunctionCall const& _funCall)
 {
 	auto const& args = _funCall.arguments();
@@ -272,6 +326,8 @@ void CHC::visitAssert(FunctionCall const& _funCall)
 	solAssert(args.front()->annotation().type->category() == Type::Category::Bool, "");
 
 	solAssert(!m_path.empty(), "");
+
+	createErrorBlock();
 
 	smt::Expression assertNeg = !(m_context.expression(*args.front())->currentValue());
 	smt::Expression assertionError = smt::Expression::implies(
@@ -286,7 +342,6 @@ void CHC::visitAssert(FunctionCall const& _funCall)
 
 void CHC::unknownFunctionCall(FunctionCall const& _funCall)
 {
-	/// Function calls are not handled at the moment,
 	/// so always erase knowledge.
 	/// TODO remove when function calls get predicates/blocks.
 	eraseKnowledge();
@@ -318,6 +373,94 @@ void CHC::unknownFunctionCall(FunctionCall const& _funCall)
 	}
 	else if (returnParams.size() == 1)
 		defineExpr(_funCall, currentValue(*returnParams.front()));
+}
+
+// TODO write how the encoding here works.
+void CHC::visitLoop(
+	BreakableStatement const& _loop,
+	Expression const* _condition,
+	Statement const& _body,
+	ASTNode const* _postLoop
+)
+{
+	solAssert(m_currentFunction, "");
+
+	// Create loop header block and edge from function to loop header.
+	m_predicates[&_loop] = createBlock(functionSort(*m_currentFunction), "loop_" + to_string(_loop.id()));
+	smt::Expression loopHeader = predicateCurrent(&_loop);
+	smt::Expression functionLoop = smt::Expression::implies(
+		m_path.back() && m_context.assertions(),
+		loopHeader
+	);
+	addRule(functionLoop, m_currentFunction, &_loop);
+
+	// Loop header block visits the condition and has out-edges
+	// to the loop body and back to the rest of the function.
+	pushBlock(loopHeader);
+
+	if (_condition)
+		_condition->accept(*this);
+	auto condition = _condition ? expr(*_condition) : smt::Expression(true);
+
+	// Create loop body entry block.
+	m_predicates[&_body] = createBlock(functionSort(*m_currentFunction), "loop_body_" + to_string(_body.id()));
+	// This predicate needs to be created here to take potential
+	// loop condition side-effects into account.
+	smt::Expression loopBody = predicateCurrent(&_body);
+	smt::Expression bodyEdge = smt::Expression::implies(
+		loopHeader && m_context.assertions() && condition,
+		loopBody
+	);
+	addRule(bodyEdge, &_loop, &_body);
+
+	// Loop body block visit.
+	pushBlock(loopBody);
+
+	auto functionBlocks = m_functionBlocks;
+	_body.accept(*this);
+	// TODO handle properly when break/continue are supported.
+	if (_postLoop)
+		_postLoop->accept(*this);
+
+	// If there are nested inner loops new function blocks
+	// are created within this loop body.
+	// In that case the back edge needs to come from the function block.
+	auto fromPred = m_functionBlocks > functionBlocks ?
+		predicateEntry(m_currentFunction) :
+		predicateEntry(&_body);
+	smt::Expression backEdge = smt::Expression::implies(
+		fromPred && m_context.assertions(),
+		predicateCurrent(&_loop)
+	);
+	addRule(backEdge, &_body, &_loop);
+
+	// Pop all function blocks created by nested inner loops
+	// to adjust the assertion context.
+	for (unsigned i = m_functionBlocks; i > functionBlocks; --i)
+		popBlock();
+	m_functionBlocks = functionBlocks;
+
+	// Create a new function block here such that the function
+	// index increases for outer loops.
+	// The predicate needs to be created here when the loop body
+	// predicate is on the top of the stack.
+	createFunctionBlock(*m_currentFunction);
+	smt::Expression functionAfter = predicateEntry(m_currentFunction);
+
+	popBlock();
+	// Loop body.
+
+	smt::Expression outEdge = smt::Expression::implies(
+		loopHeader && m_context.assertions() && !condition,
+		functionAfter
+	);
+	addRule(outEdge, &_loop, m_currentFunction);
+
+	popBlock();
+	// Loop header.
+
+	pushBlock(predicateCurrent(m_currentFunction));
+	++m_functionBlocks;
 }
 
 void CHC::reset()
@@ -430,6 +573,11 @@ smt::Expression CHC::error()
 	return (*m_errorPredicate)({});
 }
 
+smt::Expression CHC::error(unsigned _idx)
+{
+	return m_errorPredicate->valueAtIndex(_idx)({});
+}
+
 shared_ptr<smt::SymbolicFunctionVariable> CHC::createBlock(smt::SortPointer _sort, string _name)
 {
 	auto block = make_shared<smt::SymbolicFunctionVariable>(
@@ -453,6 +601,13 @@ void CHC::createFunctionBlock(FunctionDefinition const& _function)
 			functionSort(_function),
 			predicateName(_function)
 		);
+}
+
+void CHC::createErrorBlock()
+{
+	solAssert(m_errorPredicate, "");
+	m_errorPredicate->increaseIndex();
+	m_interface->registerRelation(m_errorPredicate->currentValue());
 }
 
 vector<smt::Expression> CHC::functionParameters(FunctionDefinition const& _function)
@@ -488,6 +643,14 @@ smt::Expression CHC::predicateEntry(ASTNode const* _node)
 {
 	solAssert(!m_path.empty(), "");
 	return (*m_predicates.at(_node))(m_path.back().arguments);
+}
+
+void CHC::addRule(smt::Expression const& _rule, ASTNode const* _from, ASTNode const* _to)
+{
+	m_interface->addRule(
+		_rule,
+		m_predicates.at(_from)->currentName() + "_to_" + m_predicates.at(_to)->currentName()
+	);
 }
 
 bool CHC::query(smt::Expression const& _query, langutil::SourceLocation const& _location)
