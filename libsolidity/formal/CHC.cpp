@@ -68,7 +68,7 @@ bool CHC::visit(ContractDefinition const& _contract)
 	if (!SMTEncoder::visit(_contract))
 		return false;
 
-	m_stateVariables = stateVariables(_contract);
+	m_stateVariables = _contract.stateVariablesWithInheritance();
 
 	for (auto const& var: m_stateVariables)
 		// SMT solvers do not support function types as arguments.
