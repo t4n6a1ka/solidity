@@ -22,6 +22,7 @@ Compiler Features:
 
 Bugfixes:
  * ABI decoder: Ensure that decoded arrays always point to distinct memory locations.
+ * Scanner: Fix doxygen-style parsing of multi-line comments with triple slashes when file is encoded with CRLF instead of LF.
  * SMTChecker: Fix internal error when inlining functions that contain tuple expressions.
  * SMTChecker: Fix pointer knowledge erasing in loops.
  * SMTChecker: Fix internal error when using compound bitwise assignment operators inside branches.
