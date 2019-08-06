@@ -19,6 +19,7 @@
  */
 
 #include <test/libsolidity/AnalysisFramework.h>
+#include <test/Options.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -246,6 +247,47 @@ BOOST_AUTO_TEST_CASE(mod)
 		}
 	)";
 	CHECK_SUCCESS_NO_WARNINGS(text);
+}
+
+
+BOOST_AUTO_TEST_CASE(import_base_1)
+{
+	CompilerStack c;
+	c.setSources({
+	{"base", R"(
+		pragma solidity >=0.0;
+		contract Base {
+			uint x;
+			address a;
+			function g() internal returns (uint) {
+				a = address(this);
+				return 2;
+			}
+		}
+	)"},
+	{"c", R"(
+		pragma solidity >=0.0;
+		pragma experimental SMTChecker;
+		import 'base';
+		contract Der is Base {
+			function f(uint y) public {
+				x += g();
+			}
+		}
+	)"}
+	});
+	c.setEVMVersion(dev::test::Options::get().evmVersion());
+	BOOST_CHECK(c.compile());
+
+	unsigned overflows = 0;
+	for (auto const& e: c.errors())
+	{
+		string const* msg = e->comment();
+		BOOST_REQUIRE(msg);
+		if (msg->find("Overflow") != string::npos)
+			++overflows;
+	}
+	BOOST_CHECK_EQUAL(overflows, 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
