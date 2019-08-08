@@ -90,7 +90,7 @@ void Interpreter::operator()(VariableDeclaration const& _declaration)
 		YulString varName = _declaration.variables.at(i).name;
 		solAssert(!m_variables.count(varName), "");
 		m_variables[varName] = values.at(i);
-		m_scopes.back().insert(varName);
+		m_scopes.back().m_symbols.insert(varName);
 	}
 }
 
@@ -165,8 +165,10 @@ void Interpreter::operator()(Block const& _block)
 		{
 			FunctionDefinition const& funDef = boost::get<FunctionDefinition>(statement);
 			m_functions[funDef.name] = &funDef;
-			m_scopes.back().insert(funDef.name);
+			m_scopes.back().m_symbols.insert(funDef.name);
 		}
+
+	m_scopes.back().m_functions = m_functions;
 
 	for (auto const& statement: _block.statements)
 	{
@@ -180,21 +182,21 @@ void Interpreter::operator()(Block const& _block)
 
 u256 Interpreter::evaluate(Expression const& _expression)
 {
-	ExpressionEvaluator ev(m_state, m_dialect, m_variables, m_functions);
+	ExpressionEvaluator ev(m_state, m_dialect, m_variables, m_functions, m_scopes);
 	ev.visit(_expression);
 	return ev.value();
 }
 
 vector<u256> Interpreter::evaluateMulti(Expression const& _expression)
 {
-	ExpressionEvaluator ev(m_state, m_dialect, m_variables, m_functions);
+	ExpressionEvaluator ev(m_state, m_dialect, m_variables, m_functions, m_scopes);
 	ev.visit(_expression);
 	return ev.values();
 }
 
 void Interpreter::closeScope()
 {
-	for (auto const& var: m_scopes.back())
+	for (auto const& var: m_scopes.back().m_symbols)
 	{
 		size_t erased = m_variables.erase(var) + m_functions.erase(var);
 		solAssert(erased == 1, "");
@@ -246,9 +248,21 @@ void ExpressionEvaluator::operator()(FunctionCall const& _funCall)
 	for (size_t i = 0; i < fun.returnVariables.size(); ++i)
 		variables[fun.returnVariables.at(i).name] = 0;
 
+	std::map<YulString, FunctionDefinition const*> context;
+
+	for (auto const& scope: m_scopes)
+	{
+		for (auto const& func: scope.m_functions)
+			context[func.first] = func.second;
+
+		if (scope.m_functions.count(fun.name))
+			break;
+	}
+
+
 	// TODO function name lookup could be a little more efficient,
 	// we have to copy the list here.
-	Interpreter interpreter(m_state, m_dialect, variables, m_functions);
+	Interpreter interpreter(m_state, m_dialect, variables, context);
 	interpreter(fun.body);
 
 	m_values.clear();

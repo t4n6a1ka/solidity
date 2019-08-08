@@ -96,6 +96,12 @@ struct InterpreterState
 	void dumpTraceAndState(std::ostream& _out) const;
 };
 
+struct Scope
+{
+	std::map<YulString, FunctionDefinition const*> m_functions;
+	std::set<YulString> m_symbols;
+};
+
 /**
  * Yul interpreter.
  */
@@ -146,7 +152,7 @@ private:
 	/// Meanings of functions.
 	std::map<YulString, FunctionDefinition const*> m_functions;
 	/// Scopes of variables and functions, used to clear them at end of blocks.
-	std::vector<std::set<YulString>> m_scopes;
+	std::vector<Scope> m_scopes;
 };
 
 /**
@@ -159,12 +165,14 @@ public:
 		InterpreterState& _state,
 		Dialect const& _dialect,
 		std::map<YulString, dev::u256> const& _variables,
-		std::map<YulString, FunctionDefinition const*> const& _functions
+		std::map<YulString, FunctionDefinition const*> const& _functions,
+		std::vector<Scope> const& _scopes
 	):
 		m_state(_state),
 		m_dialect(_dialect),
 		m_variables(_variables),
-		m_functions(_functions)
+		m_functions(_functions),
+		m_scopes(_scopes)
 	{}
 
 	void operator()(Literal const&) override;
@@ -190,6 +198,7 @@ private:
 	std::map<YulString, dev::u256> const& m_variables;
 	/// Meanings of functions.
 	std::map<YulString, FunctionDefinition const*> const& m_functions;
+	std::vector<Scope> const& m_scopes;
 	/// Current value of the expression
 	std::vector<dev::u256> m_values;
 };
